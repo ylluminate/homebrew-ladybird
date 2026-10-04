@@ -11,8 +11,12 @@ yourself.
 
 ```sh
 brew tap ylluminate/ladybird
+brew trust --cask ylluminate/ladybird/ladybird-nightly
 brew install --cask ladybird-nightly
 ```
+
+Homebrew won't load casks from a third-party tap until you trust them; the
+second line does that for this cask only.
 
 ## Update
 
