@@ -1,0 +1,260 @@
+name: Nightly
+
+on:
+  schedule:
+    # Twice a day. Runs are skipped when upstream has not moved.
+    - cron: "23 5,17 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream branch, tag or full commit hash
+        default: master
+      force:
+        description: Build even if this commit is already published
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CASK: Casks/ladybird-nightly.rb
+  KEEP_RELEASES: 14
+
+jobs:
+  check:
+    name: Check upstream
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      commit: ${{ steps.check.outputs.commit }}
+      previous: ${{ steps.check.outputs.previous }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare with the published build
+        id: check
+        env:
+          REF: ${{ inputs.ref || 'master' }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          scripts/check-upstream.sh "$REF" "$FORCE" "$CASK" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: Build macOS arm64
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 355
+    permissions:
+      contents: write
+    env:
+      COMMIT: ${{ needs.check.outputs.commit }}
+      PREVIOUS: ${{ needs.check.outputs.previous }}
+      VERSION: ${{ needs.check.outputs.version }}
+      CCACHE_COMPILERCHECK: "%compiler% -v"
+    steps:
+      - name: Note start time
+        run: echo "JOB_STARTED=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Check out Ladybird
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: LadybirdBrowser/ladybird
+          ref: ${{ env.COMMIT }}
+          persist-credentials: false
+
+      - name: Check out packaging
+        uses: actions/checkout@v7.0.1
+        with:
+          path: tap
+          fetch-depth: 0
+
+      # Upstream's own CI setup: pinned Xcode, Homebrew dependencies (including
+      # Qt), Rust, wasm-tools and vcpkg. Using it keeps this build in step with
+      # whatever upstream currently needs.
+      - name: Set up toolchain
+        id: setup
+        uses: ./.github/actions/setup
+        with:
+          os: macOS
+          arch: arm64
+          build_preset: Release
+
+      - name: Restore compiler cache
+        id: ccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.setup.outputs.ccache_path }}
+          key: ccache-macos-arm64-release-${{ github.run_id }}
+          restore-keys: ccache-macos-arm64-release-
+
+      - name: Restore vcpkg cache
+        id: vcpkg
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.setup.outputs.vcpkg_cache_path }}
+          key: vcpkg-macos-arm64-release-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: vcpkg-macos-arm64-release-
+
+      - name: Configure
+        id: configure
+        run: |
+          ccache -M 4G
+          ccache -z
+          CC=$(xcrun --find clang)
+          CXX=$(xcrun --find clang++)
+          export CC CXX
+          cmake --preset Release -B Build/release \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_CI_BASELINE_CPU=ON \
+            -DPython3_EXECUTABLE="$pythonLocation/bin/python" \
+            -DCMAKE_C_COMPILER="$CC" \
+            -DCMAKE_CXX_COMPILER="$CXX"
+
+      - name: Save vcpkg cache
+        if: always() && steps.configure.outcome == 'success' && steps.vcpkg.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.setup.outputs.vcpkg_cache_path }}
+          key: ${{ steps.vcpkg.outputs.cache-primary-key }}
+
+      # Stop compiling early enough to save the compiler cache, so a cold
+      # build that runs out of time still makes the next attempt faster.
+      - name: Build
+        run: |
+          deadline=$((JOB_STARTED + 320 * 60))
+          remaining=$((deadline - $(date +%s)))
+          echo "Time left for compiling: $((remaining / 60)) minutes"
+          perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$remaining" cmake --build Build/release
+
+      - name: Save compiler cache
+        if: always() && steps.configure.outcome == 'success'
+        run: ccache -s
+
+      - name: Upload compiler cache
+        if: always() && steps.configure.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.setup.outputs.ccache_path }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Package
+        run: tap/scripts/package-macos.sh . Build/release dist "$VERSION"
+
+      - name: Verify
+        id: verify
+        run: |
+          # Hide every place the build took libraries from, so the smoke test
+          # fails if the bundle still reaches for any of them.
+          hidden=()
+          for d in "$(brew --prefix qt)" Build/release/lib Build/release/vcpkg_installed/*/lib; do
+            [[ -d $d ]] && hidden+=("$(cd "$d" && pwd -P)")
+          done
+          restore() { for d in "${hidden[@]}"; do [[ -e "$d.hidden" ]] && mv "$d.hidden" "$d"; done; }
+          trap restore EXIT
+          for d in "${hidden[@]}"; do mv "$d" "$d.hidden"; done
+          tap/scripts/verify-bundle.sh dist/Ladybird.app "$GITHUB_OUTPUT"
+
+      - name: Create archives
+        id: archives
+        working-directory: dist
+        env:
+          MIN_MACOS: ${{ steps.verify.outputs.min_macos }}
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent Ladybird.app Ladybird-macos-arm64.zip
+
+          mkdir dmg
+          ditto Ladybird.app dmg/Ladybird.app
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Ladybird Nightly" -srcfolder dmg -format UDZO -ov Ladybird-macos-arm64.dmg
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg commit "$COMMIT" \
+            --arg commit_date "$(git -C .. log -1 --format=%cI)" \
+            --arg macos "$(sw_vers -productVersion)" \
+            --arg xcode "$(xcodebuild -version | head -n1 | cut -d' ' -f2)" \
+            --arg qt "$(qmake -query QT_VERSION)" \
+            --arg min_macos "$MIN_MACOS" \
+            --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{version: $version, commit: $commit, commit_date: $commit_date,
+              built_on: {macos: $macos, xcode: $xcode, qt: $qt},
+              minimum_macos: $min_macos, run: $run}' > build-info.json
+
+          shasum -a 256 Ladybird-macos-arm64.zip Ladybird-macos-arm64.dmg > SHA256SUMS
+          cat SHA256SUMS build-info.json
+          echo "zip_sha256=$(shasum -a 256 Ladybird-macos-arm64.zip | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="nightly-$VERSION-${COMMIT:0:10}"
+          upstream=https://github.com/LadybirdBrowser/ladybird
+          {
+            echo "Built from [\`${COMMIT:0:10}\`]($upstream/commit/$COMMIT): $(git log -1 --format=%s)"
+            echo
+            if [[ -n $PREVIOUS ]]; then
+              echo "Changes since the previous build: $upstream/compare/$PREVIOUS...${COMMIT:0:10}"
+              echo
+            fi
+            echo "Apple silicon, macOS $(jq -r .minimum_macos dist/build-info.json) or later."
+            echo "Built on macOS $(jq -r .built_on.macos dist/build-info.json) with Xcode $(jq -r .built_on.xcode dist/build-info.json) and Qt $(jq -r .built_on.qt dist/build-info.json)."
+            echo
+            echo "Not an official Ladybird release. Please report problems with this build here rather than upstream."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$(git -C tap rev-parse HEAD)" \
+            --title "Ladybird $VERSION (${COMMIT:0:10})" \
+            --notes-file notes.md \
+            --latest \
+            dist/Ladybird-macos-arm64.zip \
+            dist/Ladybird-macos-arm64.dmg \
+            dist/SHA256SUMS \
+            dist/build-info.json
+
+      - name: Update cask
+        working-directory: tap
+        env:
+          ZIP_SHA256: ${{ steps.archives.outputs.zip_sha256 }}
+          MIN_MACOS: ${{ steps.verify.outputs.min_macos }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          mkdir -p Casks
+          scripts/render-cask.sh "$VERSION" "$COMMIT" "$ZIP_SHA256" "$MIN_MACOS" > "$CASK"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$CASK"
+          git commit -m "ladybird-nightly $VERSION (${COMMIT:0:10})"
+          for attempt in 1 2 3; do
+            if git pull --rebase origin "$BRANCH" && git push origin "HEAD:$BRANCH"; then
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName,createdAt \
+            --jq "[.[] | select(.tagName | startswith(\"nightly-\"))] | sort_by(.createdAt) | reverse | .[$KEEP_RELEASES:] | .[].tagName" |
+            while read -r tag; do
+              echo "Deleting $tag"
+              gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+            done

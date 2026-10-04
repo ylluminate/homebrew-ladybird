@@ -1,0 +1,29 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: [Casks/**, README.md]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install linters
+        run: brew install shellcheck actionlint
+
+      - name: Lint
+        run: |
+          shellcheck scripts/*.sh test/*.sh
+          actionlint
+
+      - name: Run tests
+        run: test/run.sh
