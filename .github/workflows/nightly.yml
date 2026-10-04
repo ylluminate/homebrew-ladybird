@@ -135,11 +135,11 @@ jobs:
           echo "Time left for compiling: $((remaining / 60)) minutes"
           perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$remaining" cmake --build Build/release
 
-      - name: Save compiler cache
+      - name: Compiler cache statistics
         if: always() && steps.configure.outcome == 'success'
         run: ccache -s
 
-      - name: Upload compiler cache
+      - name: Save compiler cache
         if: always() && steps.configure.outcome == 'success'
         uses: actions/cache/save@v6
         with:

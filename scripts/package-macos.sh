@@ -256,12 +256,13 @@ done < <(macho_files)
 
 # --- metadata ---------------------------------------------------------------------
 
-commit=$(git -C "$src" rev-parse HEAD 2> /dev/null || echo unknown)
-if [[ -n $bundle_version ]]; then
-    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $bundle_version" "$contents/Info.plist"
-fi
-/usr/libexec/PlistBuddy -c "Delete :LadybirdSourceCommit" "$contents/Info.plist" 2> /dev/null || true
-/usr/libexec/PlistBuddy -c "Add :LadybirdSourceCommit string $commit" "$contents/Info.plist"
+set_plist_string() { # <key> <value>; upstream's Info.plist may lack the key
+    /usr/libexec/PlistBuddy -c "Delete :$1" "$contents/Info.plist" 2> /dev/null || true
+    /usr/libexec/PlistBuddy -c "Add :$1 string $2" "$contents/Info.plist"
+}
+
+[[ -z $bundle_version ]] || set_plist_string CFBundleVersion "$bundle_version"
+set_plist_string LadybirdSourceCommit "$(git -C "$src" rev-parse HEAD 2> /dev/null || echo unknown)"
 
 # --- 6. signing -------------------------------------------------------------------
 
