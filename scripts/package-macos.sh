@@ -68,24 +68,34 @@ done
 [[ ${#helpers[@]} -gt 0 ]] || die "no helper processes in $stage/libexec"
 log "Helpers: ${helpers[*]}"
 
-# Record the entitlements upstream signed each binary with, before anything
-# below rewrites the files. The build tree copies still carry intact
-# signatures; the staged copies are only a fallback.
+# Record how upstream signed every executable in Contents/MacOS (helpers, and
+# extras such as WebDriver) before anything below rewrites the files: its
+# entitlements, and whether it uses the hardened runtime. Build tree copies
+# still carry intact signatures; the bundle copy is the fallback.
 extract_entitlements() { # <binary-or-bundle> <dest>
     codesign -d --entitlements - --xml "$1" > "$2" 2> /dev/null || return 1
     [[ -s $2 ]] && plutil -lint -s "$2" > /dev/null
 }
 
-for name in "${helpers[@]}"; do
-    dest="$ent_dir/$name.plist"
-    found=
-    for candidate in "$build/libexec/$name" "$build/bin/$name" "$stage/libexec/$name"; do
-        if [[ -f $candidate ]] && extract_entitlements "$candidate" "$dest"; then
-            found=$candidate
-            break
-        fi
+executables=()
+for f in "$contents/MacOS/"*; do
+    name=$(basename "$f")
+    [[ -f $f && $name != Ladybird ]] || continue
+    file -b "$f" | grep -q 'Mach-O' || continue
+    executables+=("$name")
+    source_binary=$f
+    for candidate in "$build/libexec/$name" "$build/bin/$name"; do
+        [[ -f $candidate ]] && { source_binary=$candidate; break; }
     done
-    [[ -n $found ]] || die "could not read entitlements for helper $name"
+    if ! extract_entitlements "$source_binary" "$ent_dir/$name.plist"; then
+        rm -f "$ent_dir/$name.plist"
+        for helper in "${helpers[@]}"; do
+            [[ $helper == "$name" ]] && die "could not read entitlements for helper $name"
+        done
+    fi
+    if codesign -dv "$source_binary" 2>&1 | grep -q 'flags=.*runtime'; then
+        touch "$ent_dir/$name.runtime"
+    fi
 done
 
 if ! extract_entitlements "$build/bin/Ladybird.app" "$ent_dir/Ladybird.plist"; then
@@ -106,7 +116,7 @@ macdeployqt="$qt_prefix/bin/macdeployqt"
 
 deploy_args=(-always-overwrite -verbose=1 "-libpath=$contents/lib")
 for d in "${vcpkg_libs[@]}"; do deploy_args+=("-libpath=$d"); done
-for name in "${helpers[@]}"; do deploy_args+=("-executable=$contents/MacOS/$name"); done
+for name in "${executables[@]}"; do deploy_args+=("-executable=$contents/MacOS/$name"); done
 
 log "Deploying Qt with $macdeployqt"
 "$macdeployqt" "$app" "${deploy_args[@]}" 2>&1 | tee "$out/macdeployqt.log"
@@ -286,8 +296,11 @@ if [[ -d "$contents/Frameworks" ]]; then
     done
 fi
 
-for name in "${helpers[@]}"; do
-    sign --options runtime --entitlements "$ent_dir/$name.plist" "$contents/MacOS/$name"
+for name in "${executables[@]}"; do
+    args=()
+    [[ -f "$ent_dir/$name.plist" ]] && args+=(--entitlements "$ent_dir/$name.plist")
+    [[ -f "$ent_dir/$name.runtime" ]] && args+=(--options runtime)
+    sign ${args[@]+"${args[@]}"} "$contents/MacOS/$name"
 done
 
 sign --entitlements "$ent_dir/Ladybird.plist" "$app"
