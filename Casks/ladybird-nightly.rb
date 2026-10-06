@@ -1,6 +1,6 @@
 cask "ladybird-nightly" do
-  version "2026.10.05.1220,53b9bcd6fe"
-  sha256 "a57e07fad7b2de09ea73469db2699bbcc270188b697fba0546ce4c41a6db5cbb"
+  version "2026.10.05.2311,865b46ae1a"
+  sha256 "325d8f164f5f72971ab4591ac148e624f8bd9386febf737843858cefc83175f2"
 
   url "https://github.com/ylluminate/homebrew-ladybird/releases/download/nightly-#{version.csv.first}-#{version.csv.second}/Ladybird-macos-arm64.zip"
   name "Ladybird Nightly"
