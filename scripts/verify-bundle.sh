@@ -83,11 +83,21 @@ done < <(find "$contents" -type f -print0)
 
 [[ $problems -eq 0 ]] || die "$problems problem(s) in the bundle"
 echo "Minimum macOS: $min_macos"
+
+# Upstream signs its helper processes with the hardened runtime. Losing it does
+# not stop the browser working, so report it rather than fail the build.
+for f in "$contents/MacOS/"*; do
+    name=$(basename "$f")
+    [[ -f $f && $name != Ladybird && $name != WebDriver ]] || continue
+    if ! codesign -dv "$f" 2>&1 | grep -q 'flags=.*runtime'; then
+        echo "::warning::helper $name is not signed with the hardened runtime"
+    fi
+done
 [[ -z $output_file ]] || echo "min_macos=$min_macos" >> "$output_file"
 
 # Run a copy from somewhere else entirely, with a space in the path. In CI the
-# build tree's libraries and Homebrew's Qt are moved out of the way first, so
-# anything still loaded from there makes this fail.
+# build tree and its vcpkg libraries are moved out of the way first, so anything
+# still loaded from there makes this fail.
 log "Smoke testing a relocated copy"
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
@@ -99,10 +109,12 @@ with_timeout() { perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$@"; }
 
 with_timeout 60 "$exe" --version
 
+# The page only shows the marker if WebContent runs its script, so this checks
+# the JavaScript engine as well as page loading and rendering.
 marker="ladybird-smoke-$RANDOM$RANDOM"
 set +e
 with_timeout 180 "$exe" --headless=text --temporary-profile \
-    "data:text/html,<title>smoke</title><p>$marker</p>" \
+    "data:text/html,<title>smoke</title><p id=m></p><script>document.getElementById('m').textContent='${marker%%-*}'+'-${marker#*-}'</script>" \
     > "$scratch/stdout" 2> "$scratch/stderr"
 status=$?
 set -e

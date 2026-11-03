@@ -39,18 +39,27 @@ A scheduled workflow runs at 05:23 and 17:23 UTC. It first checks the newest
 upstream commit against the one in the cask and stops if nothing changed, so a
 quiet day costs nothing.
 
-When there is something new, it builds on a GitHub `macos-26` runner using
-upstream's own CI setup (same Xcode, Homebrew dependencies and Rust toolchain),
-with ccache and the vcpkg binary cache carried between runs. Packaging then:
+When there is something new, it builds on GitHub's `xcode-27` runner (macOS 27
+with Xcode 27, the Xcode upstream uses) with upstream's own CI setup: the same
+Homebrew dependencies, Rust toolchain and vcpkg, Qt included. ccache, sccache
+and the vcpkg binary cache are carried between runs. If upstream pins an Xcode
+the runner doesn't have, the build uses the runner's newest stable Xcode and
+notes it in the log. To build on another image, set the `MACOS_RUNNER`
+repository variable.
 
-- installs the build into a staging prefix and moves the helper processes into
-  the app bundle,
-- copies Qt and every other non-system library the app uses into the bundle and
-  rewrites library paths so it runs from anywhere,
-- re-signs everything ad hoc, keeping the hardened runtime and per-process
-  entitlements upstream gives the helpers (WebContent and WebWorker need JIT),
-- checks every binary's load commands and starts a relocated copy in headless
-  mode to make sure it can render a page.
+Packaging uses upstream's own `Meta/package-macos-test-bundle.py`, which
+upstream CI runs on every macOS build, so it follows upstream's install layout
+as it changes. It:
+
+- copies Qt, its platform plugin and every other library the app links into
+  the bundle, and rewrites library paths so it runs from anywhere,
+- re-signs the helpers ad hoc with the entitlements the build gave them
+  (hardened runtime; WebContent and WebWorker need JIT).
+
+On top of that this repository adds Qt's native macOS style plugin, records the
+build in `Info.plist`, and then checks every binary's load commands and starts a
+relocated copy in headless mode, with the build tree hidden, to make sure it can
+load a page and run its JavaScript.
 
 Only if all of that passes is a release published and the cask updated. A
 failed build leaves the previous release and cask untouched.

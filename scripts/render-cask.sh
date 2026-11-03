@@ -34,6 +34,7 @@ case "${min_macos%%.*}" in
     14) macos=":sonoma" ;;
     15) macos=":sequoia" ;;
     26) macos=":tahoe" ;;
+    27) macos=":golden_gate" ;;
     *) die "no Homebrew name known for macOS $min_macos; extend render-cask.sh" ;;
 esac
 

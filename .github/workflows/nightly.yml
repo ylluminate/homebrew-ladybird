@@ -51,7 +51,9 @@ jobs:
     name: Build macOS arm64
     needs: check
     if: needs.check.outputs.build == 'true'
-    runs-on: macos-26
+    # GitHub's macOS image with Xcode 27, matching upstream's toolchain. Set the
+    # MACOS_RUNNER repository variable to use another image without editing this.
+    runs-on: ${{ vars.MACOS_RUNNER || 'xcode-27' }}
     timeout-minutes: 355
     permissions:
       contents: write
@@ -77,8 +79,13 @@ jobs:
           path: tap
           fetch-depth: 0
 
-      # Upstream's own CI setup: pinned Xcode, Homebrew dependencies (including
-      # Qt), Rust, wasm-tools and vcpkg. Using it keeps this build in step with
+      # Upstream pins the Xcode its own machines have. If this runner doesn't
+      # have that one, use its newest stable Xcode rather than fail.
+      - name: Match upstream's Xcode pin to this runner
+        run: tap/scripts/match-xcode.sh .github/actions/setup/action.yml
+
+      # Upstream's own CI setup: Xcode, Homebrew dependencies, Rust (with
+      # sccache), wasm-tools and vcpkg. Using it keeps this build in step with
       # whatever upstream currently needs.
       - name: Set up toolchain
         id: setup
@@ -95,6 +102,14 @@ jobs:
           path: ${{ steps.setup.outputs.ccache_path }}
           key: ccache-macos-arm64-release-${{ github.run_id }}
           restore-keys: ccache-macos-arm64-release-
+
+      - name: Restore Rust compile cache
+        id: sccache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ steps.setup.outputs.sccache_path }}
+          key: sccache-macos-arm64-release-${{ github.run_id }}
+          restore-keys: sccache-macos-arm64-release-
 
       - name: Restore vcpkg cache
         id: vcpkg
@@ -137,7 +152,9 @@ jobs:
 
       - name: Compiler cache statistics
         if: always() && steps.configure.outcome == 'success'
-        run: ccache -s
+        run: |
+          ccache -s
+          sccache --show-stats || true
 
       - name: Save compiler cache
         if: always() && steps.configure.outcome == 'success'
@@ -146,7 +163,16 @@ jobs:
           path: ${{ steps.setup.outputs.ccache_path }}
           key: ${{ steps.ccache.outputs.cache-primary-key }}
 
+      - name: Save Rust compile cache
+        if: always() && steps.configure.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ steps.setup.outputs.sccache_path }}
+          key: ${{ steps.sccache.outputs.cache-primary-key }}
+
       - name: Package
+        env:
+          PYTHON: ${{ env.pythonLocation }}/bin/python
         run: tap/scripts/package-macos.sh . Build/release dist "$VERSION"
 
       - name: Verify
@@ -155,7 +181,7 @@ jobs:
           # Hide every place the build took libraries from, so the smoke test
           # fails if the bundle still reaches for any of them.
           hidden=()
-          for d in "$(brew --prefix qt)" Build/release/lib Build/release/vcpkg_installed/*/lib; do
+          for d in Build/release/lib Build/release/vcpkg_installed; do
             [[ -d $d ]] && hidden+=("$(cd "$d" && pwd -P)")
           done
           restore() { for d in "${hidden[@]}"; do [[ -e "$d.hidden" ]] && mv "$d.hidden" "$d"; done; }
@@ -182,7 +208,7 @@ jobs:
             --arg commit_date "$(git -C .. log -1 --format=%cI)" \
             --arg macos "$(sw_vers -productVersion)" \
             --arg xcode "$(xcodebuild -version | head -n1 | cut -d' ' -f2)" \
-            --arg qt "$(qmake -query QT_VERSION)" \
+            --arg qt "$(jq -r '.overrides[] | select(.name == "qtbase") | .version | split("#")[0]' ../vcpkg.json)" \
             --arg min_macos "$MIN_MACOS" \
             --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             '{version: $version, commit: $commit, commit_date: $commit_date,
